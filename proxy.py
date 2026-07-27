@@ -75,19 +75,28 @@ class Handler(BaseHTTPRequestHandler):
         try:
             resp = urllib.request.urlopen(req)
         except urllib.error.HTTPError as e:
-            raw = e.read()
-            self.send_response(e.code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+            # Upstream error (e.g. transient 504 Gateway Time-out). Relay the
+            # status/body so grok can surface/retry it, but never let a client
+            # disconnect turn into an unhandled BrokenPipeError.
+            try:
+                raw = e.read()
+                self.send_response(e.code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         except Exception as e:
-            msg = str(e).encode()
-            self.send_response(502)
-            self.send_header("Content-Length", str(len(msg)))
-            self.end_headers()
-            self.wfile.write(msg)
+            try:
+                msg = str(e).encode()
+                self.send_response(502)
+                self.send_header("Content-Length", str(len(msg)))
+                self.end_headers()
+                self.wfile.write(msg)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
 
         ctype = resp.headers.get("Content-Type", "")
@@ -100,8 +109,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(resp.status)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.end_headers()
+        self.close_connection = True
         for line in resp:
             if line.startswith(b"data: "):
                 payload = line[6:].strip()
@@ -109,10 +119,17 @@ class Handler(BaseHTTPRequestHandler):
                     continue  # drop billing.summary events
                 if payload and payload != b"[DONE]":
                     try:
-                        obj = ensure_created(json.loads(payload))
-                        line = b"data: " + json.dumps(obj).encode() + b"\n"
+                        obj = json.loads(payload)
                     except Exception:
-                        pass  # non-JSON keepalive etc., pass through
+                        pass  # non-JSON keepalive etc., pass through untouched
+                    else:
+                        # AgentRouter emits bare `data: null` and non-object
+                        # chunks that crash grok's ChatCompletionChunk parser
+                        # ("invalid type: null, expected struct"). Drop them.
+                        if not isinstance(obj, dict):
+                            continue
+                        obj = ensure_created(obj)
+                        line = b"data: " + json.dumps(obj).encode() + b"\n"
             elif b"billing" in line:
                 continue
             try:

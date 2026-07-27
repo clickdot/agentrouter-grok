@@ -58,7 +58,9 @@ grok out of the box — both fixed by `proxy.py`:
 2. **Missing `created` field.** AgentRouter omits the `created` timestamp from
    both non-streaming responses **and every streaming chunk**. Grok's
    deserializer requires it (`missing field 'created'`), so the proxy injects it.
-   It also drops the trailing `billing.summary` events.
+   It also drops `billing.summary` events and intermittent bare `data: null`
+   chunks that otherwise crash grok with
+   `invalid type: null, expected struct ChatCompletionChunk`.
 
 ---
 
