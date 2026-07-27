@@ -75,11 +75,14 @@ AR_HOME="${AR_HOME}"
 PROXY_PORT="${PROXY_PORT}"
 
 # Start the proxy if nothing is listening on the port.
-if ! python3 -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(s.connect_ex(('127.0.0.1',${PROXY_PORT})))" 2>/dev/null; then
-  AR_PROXY_PORT="\${PROXY_PORT}" nohup python3 "\${AR_HOME}/proxy.py" \
-    >"\${AR_HOME}/proxy.log" 2>&1 &
-  sleep 1
+if ! curl -s -o /dev/null -m 1 "http://127.0.0.1:\${PROXY_PORT}/" 2>/dev/null; then
+  if ! (exec 3<>"/dev/tcp/127.0.0.1/\${PROXY_PORT}") 2>/dev/null; then
+    AR_PROXY_PORT="\${PROXY_PORT}" nohup python3 "\${AR_HOME}/proxy.py" \
+      >"\${AR_HOME}/proxy.log" 2>&1 &
+    sleep 1
+  fi
 fi
+exec 3<&- 2>/dev/null || true
 
 exec env GROK_HOME="\${AR_HOME}" grok "\$@"
 WRAP
