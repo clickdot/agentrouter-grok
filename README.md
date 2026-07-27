@@ -4,32 +4,44 @@ Run xAI's open-source **Grok CLI** ([`xai-org/grok-build`](https://github.com/xa
 against [AgentRouter](https://agentrouter.org) instead of x.ai — with `gpt`, `claude`,
 `kimi`, and `glm` models, switchable at runtime with `/model`.
 
-No fork, no recompile required. A tiny local proxy makes the stock `grok` binary
-speak AgentRouter's dialect.
+No fork, no recompile. A tiny local proxy makes the stock `grok` binary speak
+AgentRouter's dialect.
 
 ---
 
 ## Quick start
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/clickdot/agentrouter-grok/main/install.sh | bash
+# 1. Install the stock grok CLI (skip if you already have it)
+curl -fsSL https://x.ai/cli/install.sh | bash
+
+# 2. Clone this repo and start the proxy
+git clone https://github.com/clickdot/agentrouter-grok
+cd agentrouter-grok
+python3 proxy.py &                     # runs on 127.0.0.1:8788
+
+# 3. Set up config: copy the template into an isolated grok home,
+#    then paste your AgentRouter token (https://agentrouter.org/register)
+mkdir -p ~/.agentrouter-grok
+cp config.template.toml ~/.agentrouter-grok/config.toml
+${EDITOR:-nano} ~/.agentrouter-grok/config.toml   # replace YOUR_AGENTROUTER_TOKEN
+
+# 4. Run grok against it (isolated — your existing ~/.grok is untouched)
+GROK_HOME=~/.agentrouter-grok grok
 ```
 
-The installer:
-1. Installs the stock `grok` CLI if you don't have it.
-2. Sets up an **isolated** `GROK_HOME` at `~/.agentrouter-grok` — your existing
-   `~/.grok` sessions and x.ai auth are left untouched.
-3. Installs the compatibility proxy and a `config.toml` with all models.
-4. Prompts for your AgentRouter token (get one at https://agentrouter.org/register).
-5. Installs a `grok2` wrapper that auto-starts the proxy and launches grok.
-
-Then just:
+Tip: add an alias so you don't type the path every time:
 
 ```bash
-grok2                 # start; switch models in-session with /model
+echo 'alias grok2="GROK_HOME=~/.agentrouter-grok grok"' >> ~/.bashrc
+source ~/.bashrc
+grok2                 # switch models in-session with /model
 grok2 -m opus         # launch on Claude Opus
 grok2 -p "17 * 23?"   # headless one-shot
 ```
+
+Keep `python3 proxy.py` running while you use grok (background it, or use the
+optional installer / systemd unit below to manage it for you).
 
 ## Models
 
@@ -64,34 +76,28 @@ grok out of the box — both fixed by `proxy.py`:
 
 ---
 
-## Manual setup (no installer)
+## Optional: one-command installer
+
+If you'd rather not manage the proxy and config by hand, `install.sh` does the
+clone-time steps for you — installs grok if missing, drops the proxy and config
+into `~/.agentrouter-grok`, prompts for your token, and installs a `grok2`
+wrapper that auto-starts the proxy:
 
 ```bash
-# 1. stock grok
-curl -fsSL https://x.ai/cli/install.sh | bash
-
-# 2. proxy (keep running; systemd unit or nohup)
-python3 proxy.py                       # 127.0.0.1:8788
-
-# 3. config — copy config.template.toml to an isolated GROK_HOME,
-#    replace YOUR_AGENTROUTER_TOKEN, then:
-GROK_HOME=~/.agentrouter-grok grok
+curl -fsSL https://raw.githubusercontent.com/clickdot/agentrouter-grok/main/install.sh | bash
 ```
 
-## Three ways to use this repo
+## Want a standalone renamed binary?
 
-| You want… | Use |
-|-----------|-----|
-| Just the pieces + docs | `proxy.py` + `config.template.toml` (this repo's base) |
-| A one-command install + `grok2` wrapper | `install.sh` |
-| A standalone renamed binary | see [`FORK.md`](FORK.md) (heavy; still needs the proxy) |
+See [`FORK.md`](FORK.md) — heavy (recompiles the Rust CLI), and it still needs
+the proxy running, so the clone-and-run flow above is almost always the better choice.
 
 ---
 
 ## Security notes
 
-- Your token is written only to your local `~/.agentrouter-grok/config.toml`
-  (chmod 600). It is never committed here — the template ships a placeholder.
+- Your token lives only in your local `~/.agentrouter-grok/config.toml`. It is
+  never committed here — the template ships a placeholder.
 - The config uses static-key (BYOK) auth, so grok never sends x.ai session tokens.
 - All prompts/code route through `agentrouter.org`. Use accordingly.
 
