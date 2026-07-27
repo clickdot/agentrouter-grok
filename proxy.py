@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""
+AgentRouter <-> Grok CLI compatibility proxy.
+
+Grok's CLI talks a strict OpenAI chat-completions dialect. AgentRouter (built on
+One API) diverges in two ways that break Grok out of the box:
+
+  1. Client gating: requests without the codex_cli_rs client identity are
+     rejected with `401 unauthorized client detected`. This proxy injects the
+     required `User-Agent` and `originator` headers on every upstream request.
+
+  2. Missing `created` field: AgentRouter omits the `created` timestamp from
+     both non-streaming responses AND every streaming `chat.completion.chunk`.
+     Grok's deserializer treats `created` as mandatory and errors with
+     `missing field 'created'`. This proxy injects it where absent.
+
+It also drops the trailing `billing.summary` SSE events that strict parsers choke on.
+
+Usage:
+    python3 proxy.py                      # listens on 127.0.0.1:8788
+    AR_PROXY_PORT=9000 python3 proxy.py   # custom port
+    AR_UPSTREAM=https://agentrouter.org python3 proxy.py
+
+Point Grok's config `base_url` at http://127.0.0.1:<port>/v1
+"""
+import json
+import os
+import time
+import urllib.request
+import urllib.error
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+UPSTREAM = os.environ.get("AR_UPSTREAM", "https://agentrouter.org").rstrip("/")
+HOST = os.environ.get("AR_PROXY_HOST", "127.0.0.1")
+PORT = int(os.environ.get("AR_PROXY_PORT", "8788"))
+
+# codex_cli_rs identity is what AgentRouter's One API gateway accepts.
+CLIENT_UA = os.environ.get("AR_CLIENT_UA", "codex_cli_rs/0.80.0")
+CLIENT_ORIGINATOR = os.environ.get("AR_CLIENT_ORIGINATOR", "codex_cli_rs")
+
+# Headers we must not forward verbatim upstream.
+SKIP_REQ_HEADERS = ("host", "content-length", "transfer-encoding",
+                    "accept-encoding", "connection")
+# Headers we must not echo back to the client (we recompute length; content is
+# already decoded so any upstream content-encoding is stale).
+SKIP_RESP_HEADERS = ("transfer-encoding", "content-length",
+                     "content-encoding", "connection")
+
+
+def ensure_created(obj):
+    if isinstance(obj, dict) and "created" not in obj:
+        obj["created"] = int(time.time())
+    return obj
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass  # quiet
+
+    def _build_upstream_request(self, method):
+        url = UPSTREAM + self.path
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else None
+        headers = {k: v for k, v in self.headers.items()
+                   if k.lower() not in SKIP_REQ_HEADERS}
+        headers["User-Agent"] = CLIENT_UA
+        headers["originator"] = CLIENT_ORIGINATOR
+        return urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    def _forward(self, method):
+        req = self._build_upstream_request(method)
+        try:
+            resp = urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        except Exception as e:
+            msg = str(e).encode()
+            self.send_response(502)
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+            return
+
+        ctype = resp.headers.get("Content-Type", "")
+        if "event-stream" in ctype:
+            self._relay_stream(resp)
+        else:
+            self._relay_json(resp)
+
+    def _relay_stream(self, resp):
+        self.send_response(resp.status)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        for line in resp:
+            if line.startswith(b"data: "):
+                payload = line[6:].strip()
+                if b"billing" in payload:
+                    continue  # drop billing.summary events
+                if payload and payload != b"[DONE]":
+                    try:
+                        obj = ensure_created(json.loads(payload))
+                        line = b"data: " + json.dumps(obj).encode() + b"\n"
+                    except Exception:
+                        pass  # non-JSON keepalive etc., pass through
+            elif b"billing" in line:
+                continue
+            try:
+                self.wfile.write(line)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                break
+
+    def _relay_json(self, resp):
+        raw = resp.read()
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                ensure_created(data)
+                data.pop("billing", None)
+                raw = json.dumps(data).encode()
+        except Exception:
+            pass  # non-JSON, pass through untouched
+        self.send_response(resp.status)
+        for k, v in resp.headers.items():
+            if k.lower() not in SKIP_RESP_HEADERS:
+                self.send_header(k, v)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_POST(self):
+        self._forward("POST")
+
+    def do_GET(self):
+        self._forward("GET")
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+if __name__ == "__main__":
+    print(f"[agentrouter-grok] proxy: {HOST}:{PORT} -> {UPSTREAM}", flush=True)
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

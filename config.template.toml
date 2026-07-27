@@ -1,0 +1,61 @@
+# agentrouter-grok config template
+#
+# Copy this to your GROK_HOME (default ~/.grok/config.toml, or a dedicated
+# dir like ~/.agentrouter-grok/config.toml used via GROK_HOME).
+#
+# Replace YOUR_AGENTROUTER_TOKEN below with your token from
+# https://agentrouter.org/register
+#
+# Requires proxy.py running (default http://127.0.0.1:8788). The proxy injects
+# the client-identity headers and the `created` field Grok requires.
+#
+# Switch models at runtime inside grok with:  /model
+# or at launch with:  grok -m <name>   (e.g. grok -m opus, grok -m kimi)
+
+[cli]
+installer = "internal"
+
+[ui]
+permission_mode = "always-approve"
+screen_mode = "inline"
+
+[models]
+default = "gpt"
+
+# ---- Provider: all models route through the local compatibility proxy ----
+[model_providers.agentrouter]
+base_url = "http://127.0.0.1:8788/v1"
+api_key = "YOUR_AGENTROUTER_TOKEN"
+api_backend = "chat_completions"
+
+# ---- Model aliases (left = the name you use with /model or -m) ----
+
+[model.gpt]
+model = "gpt-5.5"
+model_provider = "agentrouter"
+context_window = 128000
+
+[model.gpt-sol]
+model = "gpt-5.6-sol"
+model_provider = "agentrouter"
+context_window = 128000
+
+[model.opus]
+model = "claude-opus-4-8"
+model_provider = "agentrouter"
+context_window = 200000
+
+[model.opus-46]
+model = "claude-opus-4-6"
+model_provider = "agentrouter"
+context_window = 200000
+
+[model.kimi]
+model = "kimi-k3"
+model_provider = "agentrouter"
+context_window = 128000
+
+[model.glm]
+model = "glm-5.2"
+model_provider = "agentrouter"
+context_window = 128000
