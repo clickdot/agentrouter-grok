@@ -27,6 +27,7 @@ default = "gpt"
 base_url = "http://127.0.0.1:8788/v1"
 api_key = "YOUR_AGENTROUTER_TOKEN"
 api_backend = "chat_completions"
+preferred_auth = "api_key"
 
 # ---- Model aliases (left = the name you use with /model or -m) ----
 

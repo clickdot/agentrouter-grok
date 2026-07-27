@@ -73,7 +73,7 @@ class Handler(BaseHTTPRequestHandler):
     def _forward(self, method):
         req = self._build_upstream_request(method)
         try:
-            resp = urllib.request.urlopen(req)
+            resp = urllib.request.urlopen(req, timeout=120)
         except urllib.error.HTTPError as e:
             # Upstream error (e.g. transient 504 Gateway Time-out). Relay the
             # status/body so grok can surface/retry it, but never let a client
@@ -154,7 +154,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header(k, v)
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_POST(self):
         self._forward("POST")
