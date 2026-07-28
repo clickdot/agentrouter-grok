@@ -54,6 +54,22 @@ def ensure_created(obj):
     return obj
 
 
+def strip_nulls(obj):
+    """Recursively remove keys/elements whose value is null.
+
+    AgentRouter emits null where grok's strict deserializer expects a number or
+    struct — e.g. the final usage chunk carries `input_tokens_details: null`,
+    crashing grok with `invalid type: null, expected u32`. Also covers
+    `system_fingerprint: null`, `logprobs: null`, etc. grok tolerates absent
+    optional fields, so dropping the null ones is safe.
+    """
+    if isinstance(obj, dict):
+        return {k: strip_nulls(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [strip_nulls(v) for v in obj]
+    return obj
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -128,7 +144,7 @@ class Handler(BaseHTTPRequestHandler):
                         # ("invalid type: null, expected struct"). Drop them.
                         if not isinstance(obj, dict):
                             continue
-                        obj = ensure_created(obj)
+                        obj = strip_nulls(ensure_created(obj))
                         line = b"data: " + json.dumps(obj).encode() + b"\n"
             elif b"billing" in line:
                 continue
@@ -145,6 +161,7 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(data, dict):
                 ensure_created(data)
                 data.pop("billing", None)
+                data = strip_nulls(data)
                 raw = json.dumps(data).encode()
         except Exception:
             pass  # non-JSON, pass through untouched
