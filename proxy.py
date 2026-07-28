@@ -70,6 +70,25 @@ def strip_nulls(obj):
     return obj
 
 
+def sanitize_tool_schemas(obj):
+    """Strip `default: null` entries from outgoing JSON Schemas.
+
+    Grok's tool definitions (e.g. the workflow `args` parameter) include
+    `{"default": null, "description": ...}` schema fragments with no `type`.
+    Stricter model backends reject these with
+    `JSON Schema not supported: could not understand the instance ...`.
+    A null default is meaningless, so removing it is always safe. Applied only
+    to outgoing request bodies; leaves message content untouched.
+    """
+    if isinstance(obj, dict):
+        return {k: sanitize_tool_schemas(v)
+                for k, v in obj.items()
+                if not (k == "default" and v is None)}
+    if isinstance(obj, list):
+        return [sanitize_tool_schemas(v) for v in obj]
+    return obj
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -80,6 +99,16 @@ class Handler(BaseHTTPRequestHandler):
         url = UPSTREAM + self.path
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else None
+        # Sanitize outgoing tool JSON Schemas (strip `default: null`) that
+        # stricter backends reject with "JSON Schema not supported".
+        if body:
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and "tools" in parsed:
+                    parsed["tools"] = sanitize_tool_schemas(parsed["tools"])
+                    body = json.dumps(parsed).encode()
+            except Exception:
+                pass  # non-JSON body, leave untouched
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in SKIP_REQ_HEADERS}
         headers["User-Agent"] = CLIENT_UA
