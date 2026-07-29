@@ -11,6 +11,10 @@ This file is a patched copy of the original proxy.py with the following fixes:
 - Adds a lightweight diagnostic log when outgoing tool definitions lack a
   non-empty name, so problematic requests are easier to find.
 - Uses CRLF when rewriting SSE data lines.
+- Sanitizes empty-string tool/function names by replacing them with
+  '__unnamed_tool' to avoid upstream validation errors.
+- Runs the empty-name sanitizer on any parsed JSON body (not only when
+  "tools" is present) so top-level arrays like `input` are fixed too.
 
 Save as proxyfixed.py for review.
 """
@@ -94,6 +98,32 @@ def sanitize_tool_schemas(obj):
     return obj
 
 
+def sanitize_empty_names(obj, path="root"):
+    """Recursively replace empty-string tool/function names with a safe
+    placeholder so upstream validation does not fail.
+
+    This mutates obj in-place and returns it.
+    """
+    if isinstance(obj, dict):
+        # If this dict has a 'function' dict with an empty 'name', fix it.
+        func = obj.get("function")
+        if isinstance(func, dict):
+            name = func.get("name")
+            if name == "":
+                func["name"] = "__unnamed_tool"
+                print(f"[agentrouter-grok] warning: sanitized empty function name at {path}/function", flush=True)
+        # Direct tool definitions with empty 'name'
+        if "name" in obj and obj.get("name") == "":
+            obj["name"] = "__unnamed_tool"
+            print(f"[agentrouter-grok] warning: sanitized empty name at {path}", flush=True)
+        for k, v in obj.items():
+            sanitize_empty_names(v, path=f"{path}/{k}")
+    elif isinstance(obj, list):
+        for idx, v in enumerate(obj):
+            sanitize_empty_names(v, path=f"{path}[{idx}]")
+    return obj
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -109,6 +139,11 @@ class Handler(BaseHTTPRequestHandler):
         if body:
             try:
                 parsed = json.loads(body)
+
+                # Always sanitize empty-string names in the parsed body; this
+                # ensures top-level arrays like `input` are also fixed.
+                sanitize_empty_names(parsed)
+
                 if isinstance(parsed, dict) and "tools" in parsed:
                     parsed["tools"] = sanitize_tool_schemas(parsed["tools"])
 
@@ -125,7 +160,7 @@ class Handler(BaseHTTPRequestHandler):
                                         flush=True,
                                     )
 
-                    body = json.dumps(parsed).encode()
+                body = json.dumps(parsed).encode()
             except Exception:
                 pass  # non-JSON body, leave untouched
         headers = {k: v for k, v in self.headers.items()
@@ -200,6 +235,8 @@ class Handler(BaseHTTPRequestHandler):
                         if not isinstance(obj, dict):
                             continue
                         obj = strip_nulls(ensure_created(obj))
+                        # Sanitize empty-string names in streamed chunks too.
+                        sanitize_empty_names(obj)
                         # Use CRLF as per SSE spec when constructing lines.
                         line = b"data: " + json.dumps(obj).encode() + b"\r\n"
             elif b"billing" in line:
@@ -218,6 +255,8 @@ class Handler(BaseHTTPRequestHandler):
                 ensure_created(data)
                 data.pop("billing", None)
                 data = strip_nulls(data)
+                # Sanitize empty-string names in non-streamed JSON responses.
+                sanitize_empty_names(data)
                 raw = json.dumps(data).encode()
         except Exception:
             pass  # non-JSON, pass through untouched
