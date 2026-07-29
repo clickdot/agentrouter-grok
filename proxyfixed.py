@@ -124,6 +124,33 @@ def sanitize_empty_names(obj, path="root"):
     return obj
 
 
+def drop_empty_response_names(obj):
+    """Remove empty names from response deltas.
+
+    In a streamed tool call the function name arrives only in the first chunk;
+    continuation chunks carry `name: ""` alongside more argument text. An empty
+    name means "no name update", so it must be removed rather than replaced —
+    substituting a placeholder overwrites the real name from the first chunk
+    and every tool call arrives as that placeholder.
+    """
+    if isinstance(obj, dict):
+        if obj.get("name") == "":
+            obj.pop("name")
+
+        func = obj.get("function")
+        if isinstance(func, dict) and func.get("name") == "":
+            func.pop("name")
+
+        for value in obj.values():
+            drop_empty_response_names(value)
+
+    elif isinstance(obj, list):
+        for value in obj:
+            drop_empty_response_names(value)
+
+    return obj
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -235,8 +262,8 @@ class Handler(BaseHTTPRequestHandler):
                         if not isinstance(obj, dict):
                             continue
                         obj = strip_nulls(ensure_created(obj))
-                        # Sanitize empty-string names in streamed chunks too.
-                        sanitize_empty_names(obj)
+                        # Continuation deltas may omit the function name.
+                        drop_empty_response_names(obj)
                         # Use CRLF as per SSE spec when constructing lines.
                         line = b"data: " + json.dumps(obj).encode() + b"\r\n"
             elif b"billing" in line:
@@ -255,8 +282,7 @@ class Handler(BaseHTTPRequestHandler):
                 ensure_created(data)
                 data.pop("billing", None)
                 data = strip_nulls(data)
-                # Sanitize empty-string names in non-streamed JSON responses.
-                sanitize_empty_names(data)
+                drop_empty_response_names(data)
                 raw = json.dumps(data).encode()
         except Exception:
             pass  # non-JSON, pass through untouched
