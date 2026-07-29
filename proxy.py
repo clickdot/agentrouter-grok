@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
 """
-AgentRouter <-> Grok CLI compatibility proxy.
+AgentRouter <-> Grok CLI compatibility proxy (fixed).
 
-Grok's CLI talks a strict OpenAI chat-completions dialect. AgentRouter (built on
-One API) diverges in two ways that break Grok out of the box:
+This file is a patched copy of the original proxy.py with the following fixes:
 
-  1. Client gating: requests without the codex_cli_rs client identity are
-     rejected with `401 unauthorized client detected`. This proxy injects the
-     required `User-Agent` and `originator` headers on every upstream request.
+- Safer null stripping: drops null elements from lists and avoids removing
+  structural keys like 'name' which must be present (even if null) so we don't
+  accidentally turn a null into a missing required field.
+- Uses resp.getcode() (with fallback) instead of assuming resp.status exists.
+- Adds a lightweight diagnostic log when outgoing tool definitions lack a
+  non-empty name, so problematic requests are easier to find.
+- Uses CRLF when rewriting SSE data lines.
+- Sanitizes empty-string tool/function names by replacing them with
+  '__unnamed_tool' to avoid upstream validation errors.
+- Runs the empty-name sanitizer on any parsed JSON body (not only when
+  "tools" is present) so top-level arrays like `input` are fixed too.
 
-  2. Missing `created` field: AgentRouter omits the `created` timestamp from
-     both non-streaming responses AND every streaming `chat.completion.chunk`.
-     Grok's deserializer treats `created` as mandatory and errors with
-     `missing field 'created'`. This proxy injects it where absent.
-
-It also drops the trailing `billing.summary` SSE events that strict parsers choke on.
-
-Usage:
-    python3 proxy.py                      # listens on 127.0.0.1:8788
-    AR_PROXY_PORT=9000 python3 proxy.py   # custom port
-    AR_UPSTREAM=https://agentrouter.org python3 proxy.py
-
-Point Grok's config `base_url` at http://127.0.0.1:<port>/v1
+Save as proxyfixed.py for review.
 """
 import json
 import os
@@ -54,19 +49,33 @@ def ensure_created(obj):
     return obj
 
 
-def strip_nulls(obj):
-    """Recursively remove keys/elements whose value is null.
+def strip_nulls(obj, parent_key=None):
+    """Recursively remove keys/elements whose value is null, but avoid
+    removing structural keys that must be present (e.g. 'name').
 
-    AgentRouter emits null where grok's strict deserializer expects a number or
-    struct — e.g. the final usage chunk carries `input_tokens_details: null`,
-    crashing grok with `invalid type: null, expected u32`. Also covers
-    `system_fingerprint: null`, `logprobs: null`, etc. grok tolerates absent
-    optional fields, so dropping the null ones is safe.
+    AgentRouter emits null where grok's strict deserializer expects a number
+    or struct — e.g. the final usage chunk carries `input_tokens_details: null`.
+    We remove nulls in most places, but do not drop keys that are structural:
+    'name', 'id', 'function', 'type', 'role' (and similar). Also drop null
+    elements inside lists.
     """
+    # Keys considered structural; don't drop them even if value is None.
+    PROTECTED_KEYS = {"name", "id", "function", "type", "role", "content"}
+
     if isinstance(obj, dict):
-        return {k: strip_nulls(v) for k, v in obj.items() if v is not None}
+        out = {}
+        for k, v in obj.items():
+            # If value is None and key is protected, preserve the key/value.
+            if v is None:
+                if k in PROTECTED_KEYS:
+                    out[k] = v
+                # else drop it (skip)
+                continue
+            out[k] = strip_nulls(v, parent_key=k)
+        return out
     if isinstance(obj, list):
-        return [strip_nulls(v) for v in obj]
+        # Drop None elements inside lists; recurse into members.
+        return [strip_nulls(v, parent_key=parent_key) for v in obj if v is not None]
     return obj
 
 
@@ -89,6 +98,59 @@ def sanitize_tool_schemas(obj):
     return obj
 
 
+def sanitize_empty_names(obj, path="root"):
+    """Recursively replace empty-string tool/function names with a safe
+    placeholder so upstream validation does not fail.
+
+    This mutates obj in-place and returns it.
+    """
+    if isinstance(obj, dict):
+        # If this dict has a 'function' dict with an empty 'name', fix it.
+        func = obj.get("function")
+        if isinstance(func, dict):
+            name = func.get("name")
+            if name == "":
+                func["name"] = "__unnamed_tool"
+                print(f"[agentrouter-grok] warning: sanitized empty function name at {path}/function", flush=True)
+        # Direct tool definitions with empty 'name'
+        if "name" in obj and obj.get("name") == "":
+            obj["name"] = "__unnamed_tool"
+            print(f"[agentrouter-grok] warning: sanitized empty name at {path}", flush=True)
+        for k, v in obj.items():
+            sanitize_empty_names(v, path=f"{path}/{k}")
+    elif isinstance(obj, list):
+        for idx, v in enumerate(obj):
+            sanitize_empty_names(v, path=f"{path}[{idx}]")
+    return obj
+
+
+def drop_empty_response_names(obj):
+    """Remove empty names from response deltas.
+
+    In a streamed tool call the function name arrives only in the first chunk;
+    continuation chunks carry `name: ""` alongside more argument text. An empty
+    name means "no name update", so it must be removed rather than replaced —
+    substituting a placeholder overwrites the real name from the first chunk
+    and every tool call arrives as that placeholder.
+    """
+    if isinstance(obj, dict):
+        if obj.get("name") == "":
+            obj.pop("name")
+
+        func = obj.get("function")
+        if isinstance(func, dict) and func.get("name") == "":
+            func.pop("name")
+
+        for value in obj.values():
+            drop_empty_response_names(value)
+
+    elif isinstance(obj, list):
+        for value in obj:
+            drop_empty_response_names(value)
+
+    return obj
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -104,9 +166,28 @@ class Handler(BaseHTTPRequestHandler):
         if body:
             try:
                 parsed = json.loads(body)
+
+                # Always sanitize empty-string names in the parsed body; this
+                # ensures top-level arrays like `input` are also fixed.
+                sanitize_empty_names(parsed)
+
                 if isinstance(parsed, dict) and "tools" in parsed:
                     parsed["tools"] = sanitize_tool_schemas(parsed["tools"])
-                    body = json.dumps(parsed).encode()
+
+                    # Lightweight diagnostic: warn if any tool dict lacks a
+                    # non-empty 'name' so problematic requests are easier to find.
+                    tools = parsed.get("tools")
+                    if isinstance(tools, (list, tuple)):
+                        for idx, tool in enumerate(tools):
+                            if isinstance(tool, dict):
+                                name = tool.get("name")
+                                if not name:
+                                    print(
+                                        f"[agentrouter-grok] warning: outgoing tool #{idx} has empty name: {tool}",
+                                        flush=True,
+                                    )
+
+                body = json.dumps(parsed).encode()
             except Exception:
                 pass  # non-JSON body, leave untouched
         headers = {k: v for k, v in self.headers.items()
@@ -151,7 +232,14 @@ class Handler(BaseHTTPRequestHandler):
             self._relay_json(resp)
 
     def _relay_stream(self, resp):
-        self.send_response(resp.status)
+        # Use a portable way to get the numeric status code from the response.
+        status = getattr(resp, "status", None)
+        if status is None:
+            try:
+                status = resp.getcode()
+            except Exception:
+                status = 200
+        self.send_response(status)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
@@ -174,7 +262,10 @@ class Handler(BaseHTTPRequestHandler):
                         if not isinstance(obj, dict):
                             continue
                         obj = strip_nulls(ensure_created(obj))
-                        line = b"data: " + json.dumps(obj).encode() + b"\n"
+                        # Continuation deltas may omit the function name.
+                        drop_empty_response_names(obj)
+                        # Use CRLF as per SSE spec when constructing lines.
+                        line = b"data: " + json.dumps(obj).encode() + b"\r\n"
             elif b"billing" in line:
                 continue
             try:
@@ -191,10 +282,18 @@ class Handler(BaseHTTPRequestHandler):
                 ensure_created(data)
                 data.pop("billing", None)
                 data = strip_nulls(data)
+                drop_empty_response_names(data)
                 raw = json.dumps(data).encode()
         except Exception:
             pass  # non-JSON, pass through untouched
-        self.send_response(resp.status)
+        # Use portable status retrieval.
+        status = getattr(resp, "status", None)
+        if status is None:
+            try:
+                status = resp.getcode()
+            except Exception:
+                status = 200
+        self.send_response(status)
         for k, v in resp.headers.items():
             if k.lower() not in SKIP_RESP_HEADERS:
                 self.send_header(k, v)
