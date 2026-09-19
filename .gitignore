@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+thinking_cache.json
+config.toml

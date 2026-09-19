@@ -7,10 +7,10 @@
 # https://agentrouter.org/register
 #
 # Requires proxy.py running (default http://127.0.0.1:8788). The proxy injects
-# the client-identity headers and the `created` field Grok requires.
+# the client-identity headers and handles dialect translation.
 #
 # Switch models at runtime inside grok with:  /model
-# or at launch with:  grok -m <name>   (e.g. grok -m opus, grok -m kimi)
+# or at launch with:  grok -m <name>   (e.g. grok -m deepseek-flash, grok -m opus)
 
 [cli]
 installer = "internal"
@@ -20,7 +20,8 @@ permission_mode = "always-approve"
 screen_mode = "inline"
 
 [models]
-default = "gpt"
+default = "deepseek-flash"
+default_reasoning_effort = "high"
 
 # ---- Provider: all models route through the local compatibility proxy ----
 [model_providers.agentrouter]
@@ -28,7 +29,17 @@ base_url = "http://127.0.0.1:8788/v1"
 api_key = "YOUR_AGENTROUTER_TOKEN"
 api_backend = "chat_completions"
 
+[model_providers.agentrouter.extra_headers]
+User-Agent = "codex_cli_rs/0.80.0"
+originator = "codex_cli_rs"
+
 # ---- Model aliases (left = the name you use with /model or -m) ----
+
+[model.deepseek-flash]
+api_backend = "messages"
+model = "deepseek-v4-flash"
+model_provider = "agentrouter"
+context_window = 128000
 
 [model.gpt]
 model = "gpt-5.5"
@@ -40,13 +51,22 @@ model = "gpt-5.6-sol"
 model_provider = "agentrouter"
 context_window = 128000
 
+[model.gpt-astra]
+api_backend = "chat_completions"
+model = "gpt-6-astra"
+model_provider = "agentrouter"
+context_window = 128000
+reasoning_effort = "none"
+
 [model.opus]
+api_backend = "messages"
 model = "claude-opus-4-8"
 model_provider = "agentrouter"
 context_window = 200000
 
-[model.opus-46]
-model = "claude-opus-4-6"
+[model.opus-5]
+api_backend = "messages"
+model = "claude-opus-5"
 model_provider = "agentrouter"
 context_window = 200000
 
@@ -56,6 +76,7 @@ model_provider = "agentrouter"
 context_window = 128000
 
 [model.glm]
-model = "glm-5.2"
+api_backend = "chat_completions"
+model = "glm-5.3"
 model_provider = "agentrouter"
 context_window = 128000

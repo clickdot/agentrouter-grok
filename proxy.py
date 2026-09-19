@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-AgentRouter <-> Grok CLI compatibility proxy (fixed).
+AgentRouter <-> Grok CLI compatibility proxy.
 
-This file is a patched copy of the original proxy.py with the following fixes:
-
-- Safer null stripping: drops null elements from lists and avoids removing
-  structural keys like 'name' which must be present (even if null) so we don't
-  accidentally turn a null into a missing required field.
-- Uses resp.getcode() (with fallback) instead of assuming resp.status exists.
-- Adds a lightweight diagnostic log when outgoing tool definitions lack a
-  non-empty name, so problematic requests are easier to find.
-- Uses CRLF when rewriting SSE data lines.
-- Sanitizes empty-string tool/function names by replacing them with
-  '__unnamed_tool' to avoid upstream validation errors.
-- Runs the empty-name sanitizer on any parsed JSON body (not only when
-  "tools" is present) so top-level arrays like `input` are fixed too.
-
-Save as proxyfixed.py for review.
+Allows xAI's Grok CLI (xai-org/grok-build) to communicate with AgentRouter
+(One API / New API gateway) seamlessly by handling dialect mismatches:
+- Client gating: Spoofs codex_cli_rs identity headers required by AgentRouter.
+- Missing timestamps: Injects `created` timestamp in streaming chunks and responses.
+- Stream cleanup: Drops `billing.summary` events and bare `data: null` chunks.
+- Null stripping: Prunes nulls that crash grok's strict Rust deserializer while
+  preserving structural keys.
+- Tool name sanitization: Replaces empty tool names to avoid schema errors.
+- Smart Thinking Cache: Captures thinking traces/signatures in Anthropic messages
+  mode and restores them into outgoing assistant messages so multi-turn tool loops
+  do not trigger upstream HTTP 400 (`content[].thinking must be passed back`).
+- Missing signatures: Injects thinking block signatures to avoid Rust panics.
+- Orphan tool sanitization: Drops orphan tool call results that don't match the
+  preceding assistant message.
 """
 import json
 import os
@@ -151,6 +150,201 @@ def drop_empty_response_names(obj):
     return obj
 
 
+AR_HOME = (
+    os.environ.get("GROK_HOME")
+    or os.environ.get("AGENTROUTER_GROK_HOME")
+    or os.path.expanduser("~/.agentrouter-grok")
+)
+THINKING_CACHE_FILE = os.environ.get("AR_THINKING_CACHE") or os.path.join(AR_HOME, "thinking_cache.json")
+THINKING_CACHE = {}
+
+def load_thinking_cache():
+    global THINKING_CACHE
+    try:
+        if os.path.exists(THINKING_CACHE_FILE):
+            with open(THINKING_CACHE_FILE, "r", encoding="utf-8") as f:
+                THINKING_CACHE = json.load(f)
+    except Exception:
+        THINKING_CACHE = {}
+
+    try:
+        sessions_base = os.path.join(AR_HOME, "sessions")
+        if os.path.exists(sessions_base):
+            for root_dir, _, files in os.walk(sessions_base):
+                if "chat_history.jsonl" in files:
+                    spath = os.path.join(root_dir, "chat_history.jsonl")
+                    try:
+                        with open(spath, "r", encoding="utf-8") as f:
+                            last_thought = ""
+                            for line in f:
+                                try:
+                                    d = json.loads(line)
+                                    if d.get("type") == "reasoning":
+                                        s = d.get("summary", [])
+                                        if s and isinstance(s, list) and isinstance(s[0], dict):
+                                            last_thought = s[0].get("text", "")
+                                    elif d.get("type") == "assistant":
+                                        for tc in d.get("tool_calls", []):
+                                            tcid = tc.get("id")
+                                            if tcid and tcid not in THINKING_CACHE:
+                                                THINKING_CACHE[tcid] = {
+                                                    "type": "thinking",
+                                                    "thinking": last_thought or "analyzing tool calls...",
+                                                    "signature": "sig_seed_" + tcid
+                                                }
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+def save_thinking_cache(tool_ids, entry):
+    global THINKING_CACHE
+    if not tool_ids:
+        return
+    updated = False
+    for tid in tool_ids:
+        if tid:
+            THINKING_CACHE[tid] = entry
+            updated = True
+    if updated:
+        try:
+            if len(THINKING_CACHE) > 2000:
+                keys = list(THINKING_CACHE.keys())[:-2000]
+                for k in keys:
+                    THINKING_CACHE.pop(k, None)
+            with open(THINKING_CACHE_FILE, "w") as f:
+                json.dump(THINKING_CACHE, f)
+        except Exception:
+            pass
+
+
+def ensure_thinking_passback(parsed):
+    """Ensure all assistant messages containing tool_use have a thinking block in Anthropic format.
+    Uses authentic cached thinking traces and cryptographic signatures whenever available.
+    Prevents HTTP 400: The `content[].thinking` in the thinking mode must be passed back to the API.
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    messages = parsed.get("messages")
+    if not isinstance(messages, list):
+        return parsed
+
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "assistant":
+            content = m.get("content")
+            if isinstance(content, list):
+                has_thought = any(isinstance(c, dict) and c.get("type") == "thinking" for c in content)
+                has_tool_use = any(isinstance(c, dict) and c.get("type") == "tool_use" for c in content)
+                if not has_thought and has_tool_use:
+                    cached_entry = None
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "tool_use":
+                            tid = c.get("id")
+                            if tid and tid in THINKING_CACHE:
+                                cached_entry = THINKING_CACHE[tid]
+                                break
+                    if cached_entry:
+                        thought_block = {
+                            "type": "thinking",
+                            "thinking": cached_entry.get("thinking", "analyzing tool calls and continuing..."),
+                            "signature": cached_entry.get("signature", "sig_auto_restored")
+                        }
+                    else:
+                        thought_block = {
+                            "type": "thinking",
+                            "thinking": "analyzing tool calls and continuing...",
+                            "signature": "sig_auto_restored"
+                        }
+                    content.insert(0, thought_block)
+    return parsed
+
+
+def ensure_thinking_signature(obj):
+    """Ensure thinking blocks have a non-empty signature field for strict Anthropic deserializers."""
+    if isinstance(obj, dict):
+        cb = obj.get("content_block")
+        if isinstance(cb, dict) and cb.get("type") == "thinking":
+            if not cb.get("signature"):
+                cb["signature"] = "sig_dummy_agentrouter_thinking"
+        delta = obj.get("delta")
+        if isinstance(delta, dict) and delta.get("type") == "thinking_delta":
+            if "signature" not in delta:
+                delta["signature"] = "sig_dummy_agentrouter_thinking"
+    return obj
+
+
+def sanitize_tool_messages(parsed):
+    """Ensure tool_result blocks (Anthropic) and tool messages (OpenAI) strictly match
+    tool calls declared in the immediately preceding assistant message.
+    Prevents:
+    - OpenAI 400: `Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`
+    - Anthropic 400: `unexpected tool_use_id found in tool_result blocks... Each tool_result block must have a corresponding tool_use block in the previous message.`
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+    messages = parsed.get("messages")
+    if not isinstance(messages, list):
+        return parsed
+
+    new_messages = []
+    prev_assistant_tool_ids = set()
+
+    for m in messages:
+        if not isinstance(m, dict):
+            new_messages.append(m)
+            continue
+
+        role = m.get("role")
+
+        if role == "assistant":
+            prev_assistant_tool_ids = set()
+            tool_calls = m.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if isinstance(tc, dict) and tc.get("id"):
+                        prev_assistant_tool_ids.add(tc["id"])
+            content = m.get("content")
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("id"):
+                        prev_assistant_tool_ids.add(c["id"])
+            new_messages.append(m)
+
+        elif role == "tool":
+            tcid = m.get("tool_call_id")
+            if tcid and tcid in prev_assistant_tool_ids:
+                new_messages.append(m)
+            else:
+                print(f"[agentrouter-grok] warning: dropped orphan OpenAI tool message: tool_call_id={tcid}", flush=True)
+
+        elif role == "user":
+            content = m.get("content")
+            if isinstance(content, list):
+                filtered_content = []
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "tool_result":
+                        tuid = c.get("tool_use_id")
+                        if tuid and tuid in prev_assistant_tool_ids:
+                            filtered_content.append(c)
+                        else:
+                            print(f"[agentrouter-grok] warning: dropped orphan Anthropic tool_result: tool_use_id={tuid}", flush=True)
+                    else:
+                        filtered_content.append(c)
+                if filtered_content:
+                    m["content"] = filtered_content
+                    new_messages.append(m)
+            else:
+                new_messages.append(m)
+        else:
+            new_messages.append(m)
+
+    parsed["messages"] = new_messages
+    return parsed
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -170,6 +364,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Always sanitize empty-string names in the parsed body; this
                 # ensures top-level arrays like `input` are also fixed.
                 sanitize_empty_names(parsed)
+                ensure_thinking_passback(parsed)
+                sanitize_tool_messages(parsed)
 
                 if isinstance(parsed, dict) and "tools" in parsed:
                     parsed["tools"] = sanitize_tool_schemas(parsed["tools"])
@@ -245,6 +441,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+
+        stream_thinking_chunks = []
+        stream_thinking_sig = None
+        stream_tool_ids = []
+
         for line in resp:
             if line.startswith(b"data: "):
                 payload = line[6:].strip()
@@ -264,6 +465,33 @@ class Handler(BaseHTTPRequestHandler):
                         obj = strip_nulls(ensure_created(obj))
                         # Continuation deltas may omit the function name.
                         drop_empty_response_names(obj)
+                        ensure_thinking_signature(obj)
+
+                        # Capture thinking text, signatures, and tool IDs for the smart cache
+                        cb = obj.get("content_block")
+                        if isinstance(cb, dict):
+                            if cb.get("type") == "thinking":
+                                if cb.get("thinking"):
+                                    stream_thinking_chunks.append(cb["thinking"])
+                                if cb.get("signature"):
+                                    stream_thinking_sig = cb["signature"]
+                            elif cb.get("type") == "tool_use" and cb.get("id"):
+                                stream_tool_ids.append(cb["id"])
+
+                        delta = obj.get("delta")
+                        if isinstance(delta, dict):
+                            if delta.get("type") == "thinking_delta" and delta.get("thinking"):
+                                stream_thinking_chunks.append(delta["thinking"])
+                            elif delta.get("type") == "signature_delta" and delta.get("signature"):
+                                stream_thinking_sig = delta["signature"]
+                            elif delta.get("reasoning_content"):
+                                stream_thinking_chunks.append(delta["reasoning_content"])
+                            tcalls = delta.get("tool_calls")
+                            if isinstance(tcalls, list):
+                                for tc in tcalls:
+                                    if isinstance(tc, dict) and tc.get("id"):
+                                        stream_tool_ids.append(tc["id"])
+
                         # Use CRLF as per SSE spec when constructing lines.
                         line = b"data: " + json.dumps(obj).encode() + b"\r\n"
             elif b"billing" in line:
@@ -274,6 +502,16 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 break
 
+        # Save to thinking cache when stream ends
+        full_thought = "".join(stream_thinking_chunks)
+        if stream_tool_ids and (full_thought or stream_thinking_sig):
+            entry = {
+                "type": "thinking",
+                "thinking": full_thought or "analyzing tool calls and continuing...",
+                "signature": stream_thinking_sig or "sig_auto_cached"
+            }
+            save_thinking_cache(stream_tool_ids, entry)
+
     def _relay_json(self, resp):
         raw = resp.read()
         try:
@@ -283,6 +521,26 @@ class Handler(BaseHTTPRequestHandler):
                 data.pop("billing", None)
                 data = strip_nulls(data)
                 drop_empty_response_names(data)
+                ensure_thinking_signature(data)
+
+                # Capture thinking from JSON content
+                content = data.get("content")
+                if isinstance(content, list):
+                    entry = None
+                    tool_ids = []
+                    for c in content:
+                        if isinstance(c, dict):
+                            if c.get("type") == "thinking":
+                                entry = {
+                                    "type": "thinking",
+                                    "thinking": c.get("thinking", ""),
+                                    "signature": c.get("signature", "sig_auto_cached")
+                                }
+                            elif c.get("type") == "tool_use" and c.get("id"):
+                                tool_ids.append(c["id"])
+                    if entry and tool_ids:
+                        save_thinking_cache(tool_ids, entry)
+
                 raw = json.dumps(data).encode()
         except Exception:
             pass  # non-JSON, pass through untouched
@@ -313,5 +571,6 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 if __name__ == "__main__":
-    print(f"[agentrouter-grok] proxy: {HOST}:{PORT} -> {UPSTREAM}", flush=True)
+    load_thinking_cache()
+    print(f"[agentrouter-grok] proxy: {HOST}:{PORT} -> {UPSTREAM} (cache: {len(THINKING_CACHE)} items loaded)", flush=True)
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
