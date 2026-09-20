@@ -86,6 +86,15 @@ grok out of the box — all resolved transparently by `proxy.py`:
    rejections (`Messages with role 'tool' must be a response to a preceding message with 'tool_calls'`).
 6. **Tool Schema Fixes:** Strips empty tool/function names and cleans non-standard schema
    properties before forwarding upstream.
+7. **WAF Hazard Sanitization & 405 Recovery:** AgentRouter sits behind Alibaba Cloud WAF
+   (`errors.aliyun.com`). The WAF's generic RCE rules intercept requests whose payloads
+   contain shell command chaining (specifically `; echo`, `&& echo`, `| echo`) and abort
+   with `HTTP 405 (Method Not Allowed)`. When the model runs chained shell commands (e.g.
+   using `; echo "---";` as an output separator), subsequent turns re-send those commands
+   in the conversation history, causing consecutive 405 failures. The proxy automatically
+   neutralizes these signatures (e.g. converting to `/bin/echo`), transparently retries
+   if a 405 occurs, and wraps any unhandled HTML errors into valid JSON so Grok's Rust
+   client never crashes with `Request failed (HTTP 405)`.
 
 ---
 
